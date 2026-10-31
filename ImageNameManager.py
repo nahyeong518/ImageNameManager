@@ -1,4 +1,5 @@
-﻿import json
+import ctypes
+import json
 import os
 import shutil
 import sys
@@ -8,9 +9,21 @@ from pathlib import Path, PureWindowsPath
 from datetime import datetime
 
 try:
-    from PIL import Image, ImageGrab, ImageTk
+    from PIL import Image, ImageGrab, ImageTk, ImageDraw
 except ImportError:
-    Image = ImageGrab = ImageTk = None
+    Image = ImageGrab = ImageTk = ImageDraw = None
+
+try:
+    import pystray
+    from pystray import MenuItem as pystray_item
+except ImportError:
+    pystray = None
+
+# Windows 고해상도(DPI) 스케일링 설정
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
 
 # PyInstaller one-file EXE에서는 __file__이 임시 압축 해제 경로를 가리키므로
 # 실행 파일이 있는 폴더를 기준으로 데이터를 저장해 기존 ImageNameData를 이어 씁니다.
@@ -27,18 +40,38 @@ if getattr(sys, "frozen", False) and not DATA_DIR.exists():
         try:
             shutil.copytree(old_data_dir, DATA_DIR)
         except Exception:
-            # 복사 실패 시 원본은 건드리지 않고 새 데이터 폴더로 실행합니다.
             pass
 
 for folder in (DATA_DIR, IMAGES_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
+
+def create_tray_icon_image():
+    """트레이에 표시할 고해상도 카메라/이미지 아이콘을 생성합니다."""
+    size = (64, 64)
+    if Image is None or ImageDraw is None:
+        return None
+    img = Image.new("RGBA", size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    # 둥근 모서리 배경
+    d.rounded_rectangle([4, 4, 60, 60], radius=14, fill="#3b5bdb")
+    # 카메라 몸체
+    d.rounded_rectangle([13, 21, 51, 49], radius=6, fill="white")
+    # 렌즈 바깥 원
+    d.ellipse([23, 26, 41, 44], fill="#3b5bdb")
+    # 렌즈 중심 반사광
+    d.ellipse([27, 30, 37, 40], fill="white")
+    # 플래시 / 셔터 버튼
+    d.rectangle([20, 16, 28, 21], fill="white")
+    return img
+
+
 class ImageNameManager:
     def __init__(self, root):
         self.root = root
         self.root.title("이미지 이름 관리")
-        self.root.geometry("1000x680")
-        self.root.minsize(820, 540)
+        self.root.geometry("1060x700")
+        self.root.minsize(860, 560)
         self.items = []
         self.folders = ["기본"]
         self.selected_id = None
@@ -46,11 +79,24 @@ class ImageNameManager:
         self.preview_photo = None
         self.preview_source_image = None
         self.copied_item = None
+
+        # 시스템 트레이 및 자동 감지 관련 변수
+        self.tray_icon = None
+        self._auto_save_enabled = False
+        self._last_clip_seq = 0
+        self._tray_notified_minimize = False
+
         self.load_data()
         self.build_ui()
         self.refresh_folder_list()
         self.refresh_items()
-        self.root.protocol("WM_DELETE_WINDOW", self.confirm_save_and_close)
+
+        # 창 닫기(X) 누를 때: 트레이로 최소화 (완전 종료는 메뉴 또는 트레이에서 가능)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
+
+        # 트레이 아이콘 및 클립보드 모니터링 시작
+        self.setup_tray_icon()
+        self.start_clipboard_monitor()
 
     def load_data(self):
         if not DATA_FILE.exists():
@@ -96,8 +142,6 @@ class ImageNameManager:
                 item.setdefault("image", "")
                 item["folder"] = str(item.get("folder") or "기본").strip().strip("/") or "기본"
 
-                # 이전 버전에서 저장한 절대 경로가 폴더 이동으로 끊긴 경우,
-                # 새 ImageNameData/images 안에서 동일한 파일명을 찾아 경로를 복구합니다.
                 old_image = str(item.get("image") or "").strip()
                 if old_image and not Path(old_image).is_file():
                     filename = PureWindowsPath(old_image).name if "\\" in old_image else Path(old_image).name
@@ -125,7 +169,6 @@ class ImageNameManager:
             self.folders = normalized or ["기본"]
             if "기본" not in self.folders:
                 self.folders.insert(0, "기본")
-            # 복구된 경로를 즉시 저장해 다음 실행부터도 정상 경로를 사용합니다.
             if paths_migrated:
                 self.save_data()
         except Exception as e:
@@ -144,7 +187,6 @@ class ImageNameManager:
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
-            # 교체 전에 현재 정상 파일을 백업해 두어 복구 가능성을 높입니다.
             if DATA_FILE.exists():
                 try:
                     with DATA_FILE.open("r", encoding="utf-8") as current:
@@ -152,7 +194,6 @@ class ImageNameManager:
                     backup_file = DATA_FILE.with_suffix(DATA_FILE.suffix + ".bak")
                     shutil.copy2(DATA_FILE, backup_file)
                 except (json.JSONDecodeError, OSError):
-                    # 손상된 기존 파일은 정상 백업을 덮어쓰지 않습니다.
                     pass
             os.replace(temp_file, DATA_FILE)
         except Exception:
@@ -163,11 +204,265 @@ class ImageNameManager:
                 pass
             raise
 
-    def confirm_save_and_close(self):
-        """종료 시 자동 저장하고, 저장 확인 안내 후 종료합니다."""
+    # ------------------ 시스템 트레이 및 원클릭 저장 기능 ------------------
+
+    def setup_tray_icon(self):
+        """작업표시줄 트레이(알림 영역) 아이콘과 우클릭 메뉴를 등록합니다."""
+        if pystray is None:
+            return
+
+        icon_img = create_tray_icon_image()
+        if icon_img is None:
+            return
+
+        def make_menu():
+            return pystray.Menu(
+                pystray.MenuItem("📸 클립보드 스크린샷 바로 저장 (원클릭)", self.tray_quick_save, default=True),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("⚡ 스크린샷 자동 저장", self.tray_toggle_auto_save, checked=lambda item: self._auto_save_enabled),
+                pystray.MenuItem("📂 이미지 저장 폴더 열기", self.tray_open_folder),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("🪟 창 열기 / 숨기기", self.tray_toggle_window),
+                pystray.MenuItem("❌ 프로그램 완전 종료", self.tray_quit)
+            )
+
+        self.tray_icon = pystray.Icon(
+            "ImageNameManager",
+            icon_img,
+            "이미지 이름 관리 (클릭: 스크린샷 즉시 저장)",
+            menu=make_menu()
+        )
+        try:
+            self.tray_icon.run_detached()
+        except Exception as e:
+            print(f"트레이 아이콘 실행 실패: {e}")
+            self.tray_icon = None
+
+    def tray_quick_save(self, icon=None, item=None):
+        """트레이 아이콘 클릭 또는 메뉴 클릭 시 실행: 클립보드 이미지 즉시 저장"""
+        self.root.after(0, lambda: self.quick_save_clipboard(notify=True, source="트레이 원클릭"))
+
+    def tray_toggle_auto_save(self, icon=None, item=None):
+        """트레이 메뉴에서 스크린샷 자동 저장 토글"""
+        self.root.after(0, self.toggle_auto_save)
+
+    def tray_open_folder(self, icon=None, item=None):
+        """트레이 메뉴에서 저장 폴더 열기"""
+        self.root.after(0, self.open_images_folder)
+
+    def tray_toggle_window(self, icon=None, item=None):
+        """트레이 메뉴에서 메인 창 보이기/숨기기"""
+        self.root.after(0, self.toggle_window)
+
+    def tray_quit(self, icon=None, item=None):
+        """트레이 메뉴에서 완전 종료"""
+        self.root.after(0, self.quit_application)
+
+    def toggle_window(self):
+        """메인 창을 숨기거나 화면 앞으로 가져옵니다."""
+        if self.root.state() == "withdrawn":
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        else:
+            self.root.withdraw()
+
+    def on_window_close(self):
+        """창 닫기(X) 버튼을 누르면 종료 대신 트레이로 최소화하여 대기합니다."""
         try:
             self.save_data()
-            # 실제 저장 파일을 다시 읽어 정상 기록 여부와 데이터 구조를 확인합니다.
+        except Exception:
+            pass
+
+        if self.tray_icon:
+            self.root.withdraw()
+            if not self._tray_notified_minimize:
+                self._tray_notified_minimize = True
+                self.notify_user(
+                    "프로그램이 작업표시줄 트레이로 최소화되었습니다.\n"
+                    "트레이 아이콘을 클릭하면 언제든 스크린샷이 저장됩니다.\n"
+                    "완전 종료는 트레이 아이콘 우클릭 → '프로그램 완전 종료'를 누르세요.",
+                    "이미지 이름 관리"
+                )
+        else:
+            self.confirm_save_and_close()
+
+    def quit_application(self):
+        """데이터를 저장하고 트레이 아이콘과 프로그램을 완전히 종료합니다."""
+        try:
+            self.save_data()
+        except Exception as e:
+            messagebox.showerror("저장 오류", f"종료 중 데이터 저장에 실패했습니다.\n{e}", parent=self.root)
+            return
+
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+
+        self.root.destroy()
+        sys.exit(0)
+
+    def open_images_folder(self):
+        """이미지가 저장되는 실제 폴더를 윈도우 파일 탐색기로 엽니다."""
+        try:
+            os.startfile(IMAGES_DIR)
+        except Exception as e:
+            messagebox.showerror("폴더 열기 오류", f"폴더를 열 수 없습니다.\n{e}", parent=self.root)
+
+    def notify_user(self, message, title="이미지 이름 관리"):
+        """트레이 말풍선/토스트 알림을 띄웁니다."""
+        if self.tray_icon:
+            try:
+                self.tray_icon.notify(message, title)
+            except Exception:
+                pass
+
+    def quick_save_clipboard(self, notify=True, source="원클릭"):
+        """클립보드 이미지를 확인하여 즉시 IMAGES_DIR에 저장하고 데이터베이스에 등록합니다."""
+        if ImageGrab is None:
+            if notify:
+                self.notify_user("Pillow 라이브러리가 필요합니다.", "오류")
+            return False
+
+        try:
+            grabbed = ImageGrab.grabclipboard()
+            if isinstance(grabbed, Image.Image):
+                now = datetime.now()
+                time_code = now.strftime("%Y%m%d_%H%M%S")
+                filename = f"screenshot_{time_code}_{now.strftime('%f')[:3]}.png"
+                path = IMAGES_DIR / filename
+                grabbed.save(path, "PNG")
+
+                target_folder = self.selected_folder() or self.folder_var.get().strip() or "기본"
+                if target_folder not in self.folders:
+                    target_folder = "기본" if "기본" in self.folders else (self.folders[0] if self.folders else "기본")
+
+                item_name = f"스크린샷_{time_code}"
+                new_item = {
+                    "id": str(now.timestamp()),
+                    "name": item_name,
+                    "folder": target_folder,
+                    "image": str(path.resolve())
+                }
+                self.items.append(new_item)
+                self.save_data()
+
+                self.refresh_items()
+                self.status_var.set(f"[{source}] '{item_name}' 이미지가 '{target_folder}' 폴더에 저장되었습니다.")
+
+                if notify:
+                    self.notify_user(
+                        f"스크린샷이 저장되었습니다!\n파일명: {filename}\n폴더: [{target_folder}]",
+                        "스크린샷 원클릭 저장 완료"
+                    )
+                return True
+
+            elif isinstance(grabbed, list) and grabbed:
+                src_path = Path(grabbed[0])
+                if src_path.is_file() and src_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+                    now = datetime.now()
+                    time_code = now.strftime("%Y%m%d_%H%M%S")
+                    filename = f"file_{time_code}_{src_path.name}"
+                    dest = IMAGES_DIR / filename
+                    shutil.copy2(src_path, dest)
+
+                    target_folder = self.selected_folder() or self.folder_var.get().strip() or "기본"
+                    if target_folder not in self.folders:
+                        target_folder = "기본" if "기본" in self.folders else (self.folders[0] if self.folders else "기본")
+
+                    item_name = src_path.stem
+                    new_item = {
+                        "id": str(now.timestamp()),
+                        "name": item_name,
+                        "folder": target_folder,
+                        "image": str(dest.resolve())
+                    }
+                    self.items.append(new_item)
+                    self.save_data()
+
+                    self.refresh_items()
+                    self.status_var.set(f"[{source}] '{item_name}' 이미지를 저장했습니다.")
+
+                    if notify:
+                        self.notify_user(
+                            f"클립보드 파일이 저장되었습니다!\n파일명: {filename}\n폴더: [{target_folder}]",
+                            "이미지 저장 완료"
+                        )
+                    return True
+
+            if notify:
+                self.notify_user(
+                    "클립보드에 이미지가 없습니다.\nWin + Shift + S 또는 스크린샷을 찍은 후 다시 눌러주세요.",
+                    "스크린샷 없음"
+                )
+            return False
+
+        except Exception as e:
+            if notify:
+                self.notify_user(f"저장 중 오류 발생: {e}", "오류")
+            return False
+
+    def toggle_auto_save(self):
+        """스크린샷 자동 감지 저장 ON / OFF 토글"""
+        self._auto_save_enabled = not self._auto_save_enabled
+        state_str = "ON" if self._auto_save_enabled else "OFF"
+        if hasattr(self, "auto_save_btn"):
+            self.auto_save_btn.configure(
+                text=f"⚡ 자동 저장: {state_str}",
+                style="Accent.TButton" if self._auto_save_enabled else "Soft.TButton"
+            )
+        if self.tray_icon:
+            try:
+                self.tray_icon.update_menu()
+            except Exception:
+                pass
+
+        if self._auto_save_enabled:
+            # 켜지는 시점의 클립보드 번호를 기록하여 과거 내용이 즉시 중복 저장되지 않도록 방지
+            try:
+                self._last_clip_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+            except Exception:
+                pass
+            self.notify_user(
+                "⚡ 스크린샷 자동 저장이 활성화되었습니다.\n"
+                "이제 Win+Shift+S 등으로 캡처만 하면 클릭 없이도 폴더에 바로 저장됩니다!",
+                "자동 저장 ON"
+            )
+            self.status_var.set("⚡ 스크린샷 자동 저장 활성화됨 (캡처 시 즉시 자동 저장)")
+        else:
+            self.notify_user("스크린샷 자동 저장이 해제되었습니다.", "자동 저장 OFF")
+            self.status_var.set("스크린샷 자동 저장 해제됨")
+
+    def start_clipboard_monitor(self):
+        """윈도우 클립보드 변경을 가볍게 주기적으로 감지하여 새 스크린샷 자동 저장을 수행합니다."""
+        try:
+            self._last_clip_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+        except Exception:
+            self._last_clip_seq = 0
+
+        def monitor_tick():
+            if self._auto_save_enabled:
+                try:
+                    seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+                    if seq != self._last_clip_seq:
+                        self._last_clip_seq = seq
+                        # 스크린샷 툴이 클립보드에 쓰기를 마칠 수 있도록 250ms 후 저장
+                        self.root.after(250, lambda: self.quick_save_clipboard(notify=True, source="자동 감지"))
+                except Exception:
+                    pass
+            self.root.after(500, monitor_tick)
+
+        self.root.after(500, monitor_tick)
+
+    # ------------------ 기존 UI 및 관리 로직 ------------------
+
+    def confirm_save_and_close(self):
+        """종료 시 자동 저장하고 종료합니다."""
+        try:
+            self.save_data()
             with DATA_FILE.open("r", encoding="utf-8") as f:
                 saved = json.load(f)
             if (not isinstance(saved, dict)
@@ -182,19 +477,28 @@ class ImageNameManager:
             )
             return
 
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+
         messagebox.showinfo(
             "저장 완료",
             "저장되었습니다.\n이미지 목록과 폴더 정보가 안전하게 저장되었습니다.",
             parent=self.root
         )
         self.root.destroy()
+        sys.exit(0)
 
     def build_ui(self):
         self.root.configure(bg="#171a21")
         self.root.option_add("*Font", ("Malgun Gothic", 10))
         style = ttk.Style(self.root)
-        try: style.theme_use("clam")
-        except tk.TclError: pass
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
         style.configure("TFrame", background="#171a21")
         style.configure("TLabel", background="#171a21", foreground="#e1e7f0")
         style.configure("TButton", padding=(10, 7), background="#303947", foreground="#e1e7f0", borderwidth=0)
@@ -216,22 +520,50 @@ class ImageNameManager:
         self.root.option_add("*Menu.foreground", "#e1e7f0")
         self.root.option_add("*Menu.activeBackground", "#344b70")
         self.root.option_add("*Menu.activeForeground", "#ffffff")
-        outer=tk.Frame(self.root,bg="#171a21"); outer.pack(fill="both",expand=True,padx=18,pady=16)
-        banner=tk.Frame(outer,bg="#111827",height=82); banner.pack(fill="x",pady=(0,14)); banner.pack_propagate(False)
-        tk.Label(banner,text="IMAGE LIBRARY",bg="#111827",fg="#222833",font=("Malgun Gothic",17,"bold")).pack(anchor="w",padx=22,pady=(12,0))
-        tk.Label(banner,text="이미지를 이름과 폴더별로 깔끔하게 정리하세요",bg="#111827",fg="#aebbd0",font=("Malgun Gothic",9)).pack(anchor="w",padx=22)
-        self.header_count=tk.Label(banner,text="0 ITEMS",bg="#263449",fg="#e6edf7",font=("Malgun Gothic",9,"bold"),padx=13,pady=7); self.header_count.pack(side="right",anchor="e",padx=20)
-        body=tk.Frame(outer,bg="#171a21"); body.pack(fill="both",expand=True)
-        side=tk.Frame(body,bg="#222833",highlightbackground="#343c49",highlightthickness=1,width=290); side.pack(side="left",fill="y",padx=(0,12)); side.pack_propagate(False)
-        tk.Label(side,text="폴더",bg="#222833",fg="#e6eaf2",font=("Malgun Gothic",12,"bold")).pack(anchor="w",padx=15,pady=(17,3))
-        tk.Label(side,text="분류를 선택하세요",bg="#222833",fg="#929daf",font=("Malgun Gothic",9)).pack(anchor="w",padx=15,pady=(0,9))
-        tree_wrap=tk.Frame(side,bg="#222833"); tree_wrap.pack(fill="both",expand=True,padx=8,pady=(0,8))
-        self.folder_tree=ttk.Treeview(tree_wrap,show="tree",selectmode="extended")
-        tree_scroll=ttk.Scrollbar(tree_wrap,orient="vertical",command=self.folder_tree.yview)
+
+        outer = tk.Frame(self.root, bg="#171a21")
+        outer.pack(fill="both", expand=True, padx=18, pady=16)
+
+        # 상단 배너 영역
+        banner = tk.Frame(outer, bg="#111827", height=82)
+        banner.pack(fill="x", pady=(0, 14))
+        banner.pack_propagate(False)
+
+        left_titles = tk.Frame(banner, bg="#111827")
+        left_titles.pack(side="left", padx=22, fill="y")
+        tk.Label(left_titles, text="IMAGE LIBRARY", bg="#111827", fg="#5c7cfa", font=("Malgun Gothic", 16, "bold")).pack(anchor="w", pady=(12, 0))
+        tk.Label(left_titles, text="트레이 아이콘 클릭으로 스크린샷 즉시 원클릭 저장", bg="#111827", fg="#aebbd0", font=("Malgun Gothic", 9)).pack(anchor="w")
+
+        right_controls = tk.Frame(banner, bg="#111827")
+        right_controls.pack(side="right", anchor="e", padx=20)
+
+        # 상단 빠른 조작 버튼들
+        ttk.Button(right_controls, text="📂 저장 폴더 열기", style="Soft.TButton", command=self.open_images_folder).pack(side="left", padx=4)
+        self.auto_save_btn = ttk.Button(right_controls, text="⚡ 자동 저장: OFF", style="Soft.TButton", command=self.toggle_auto_save)
+        self.auto_save_btn.pack(side="left", padx=4)
+        ttk.Button(right_controls, text="🔽 트레이로 숨기기", command=self.toggle_window).pack(side="left", padx=4)
+
+        self.header_count = tk.Label(right_controls, text="0 ITEMS", bg="#263449", fg="#e6edf7", font=("Malgun Gothic", 9, "bold"), padx=13, pady=7)
+        self.header_count.pack(side="left", padx=(8, 0))
+
+        body = tk.Frame(outer, bg="#171a21")
+        body.pack(fill="both", expand=True)
+
+        # 좌측 폴더 트리 패널
+        side = tk.Frame(body, bg="#222833", highlightbackground="#343c49", highlightthickness=1, width=290)
+        side.pack(side="left", fill="y", padx=(0, 12))
+        side.pack_propagate(False)
+        tk.Label(side, text="폴더", bg="#222833", fg="#e6eaf2", font=("Malgun Gothic", 12, "bold")).pack(anchor="w", padx=15, pady=(17, 3))
+        tk.Label(side, text="분류를 선택하세요", bg="#222833", fg="#929daf", font=("Malgun Gothic", 9)).pack(anchor="w", padx=15, pady=(0, 9))
+        tree_wrap = tk.Frame(side, bg="#222833")
+        tree_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.folder_tree = ttk.Treeview(tree_wrap, show="tree", selectmode="extended")
+        tree_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.folder_tree.yview)
         self.folder_tree.configure(yscrollcommand=tree_scroll.set)
-        self.folder_tree.pack(side="left",fill="both",expand=True); tree_scroll.pack(side="right",fill="y")
-        self.folder_tree.bind("<<TreeviewSelect>>",self.on_folder_select)
-        # 바탕화면처럼 드래그 영역으로 폴더 여러 개 선택
+        self.folder_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+        self.folder_tree.bind("<<TreeviewSelect>>", self.on_folder_select)
+
         self._folder_drag_start_y = None
         self._folder_drag_start_x = None
         self._folder_dragging = False
@@ -245,26 +577,44 @@ class ImageNameManager:
         self.folder_context_menu.add_separator()
         self.folder_move_menu = tk.Menu(self.folder_context_menu, tearoff=0)
         self.folder_context_menu.add_cascade(label="선택 폴더 이동", menu=self.folder_move_menu)
-        tk.Frame(side,bg="#343c49",height=1).pack(fill="x",padx=14,pady=(0,7))
-        ttk.Button(side,text="＋ 폴더 추가",style="Soft.TButton",command=self.add_root_folder).pack(fill="x",padx=10,pady=2)
-        ttk.Button(side,text="＋ 하위 폴더 추가",style="Soft.TButton",command=self.add_folder).pack(fill="x",padx=10,pady=2)
-        ttk.Button(side,text="이름 변경",command=self.rename_folder).pack(fill="x",padx=10,pady=2)
-        ttk.Button(side,text="폴더 이동",command=self.move_folder).pack(fill="x",padx=10,pady=2)
-        ttk.Button(side,text="폴더 삭제",command=self.delete_folder).pack(fill="x",padx=10,pady=(2,10))
-        main=tk.Frame(body,bg="#222833",highlightbackground="#343c49",highlightthickness=1); main.pack(side="left",fill="both",expand=True)
-        top=tk.Frame(main,bg="#222833"); top.pack(fill="x",padx=17,pady=(15,8))
-        tk.Label(top,text="내 이미지",bg="#222833",fg="#e6eaf2",font=("Malgun Gothic",14,"bold")).pack(side="left")
-        self.search_var=tk.StringVar()
-        ttk.Button(top,text="검색 지우기",command=self.clear_search).pack(side="right",padx=(6,0))
-        ent=ttk.Entry(top,textvariable=self.search_var,width=28); ent.pack(side="right"); ent.bind("<KeyRelease>",lambda e:self.refresh_items())
+
+        tk.Frame(side, bg="#343c49", height=1).pack(fill="x", padx=14, pady=(0, 7))
+        ttk.Button(side, text="＋ 폴더 추가", style="Soft.TButton", command=self.add_root_folder).pack(fill="x", padx=10, pady=2)
+        ttk.Button(side, text="＋ 하위 폴더 추가", style="Soft.TButton", command=self.add_folder).pack(fill="x", padx=10, pady=2)
+        ttk.Button(side, text="이름 변경", command=self.rename_folder).pack(fill="x", padx=10, pady=2)
+        ttk.Button(side, text="폴더 이동", command=self.move_folder).pack(fill="x", padx=10, pady=2)
+        ttk.Button(side, text="폴더 삭제", command=self.delete_folder).pack(fill="x", padx=10, pady=(2, 10))
+
+        # 중앙 목록 및 편집 패널
+        main = tk.Frame(body, bg="#222833", highlightbackground="#343c49", highlightthickness=1)
+        main.pack(side="left", fill="both", expand=True)
+
+        top = tk.Frame(main, bg="#222833")
+        top.pack(fill="x", padx=17, pady=(15, 8))
+        tk.Label(top, text="내 이미지", bg="#222833", fg="#e6eaf2", font=("Malgun Gothic", 14, "bold")).pack(side="left")
+        self.search_var = tk.StringVar()
+        ttk.Button(top, text="검색 지우기", command=self.clear_search).pack(side="right", padx=(6, 0))
+        ent = ttk.Entry(top, textvariable=self.search_var, width=28)
+        ent.pack(side="right")
+        ent.bind("<KeyRelease>", lambda e: self.refresh_items())
         ent.insert(0, "")
-        wrap=tk.Frame(main,bg="#222833"); wrap.pack(fill="both",expand=True,padx=17,pady=(2,12))
-        self.listbox=tk.Listbox(wrap,selectmode="extended",exportselection=False,relief="flat",bg="#191e27",fg="#dce3ee",selectbackground="#344b70",selectforeground="#ffffff",activestyle="none",font=("Malgun Gothic",10),highlightthickness=1,highlightbackground="#343c49")
-        sb=ttk.Scrollbar(wrap,orient="vertical",command=self.listbox.yview); self.listbox.configure(yscrollcommand=sb.set)
-        self.listbox.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y"); self.listbox.bind("<<ListboxSelect>>", self.on_list_selection)
+
+        wrap = tk.Frame(main, bg="#222833")
+        wrap.pack(fill="both", expand=True, padx=17, pady=(2, 12))
+        self.listbox = tk.Listbox(
+            wrap, selectmode="extended", exportselection=False, relief="flat",
+            bg="#191e27", fg="#dce3ee", selectbackground="#344b70", selectforeground="#ffffff",
+            activestyle="none", font=("Malgun Gothic", 10), highlightthickness=1, highlightbackground="#343c49"
+        )
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.listbox.bind("<<ListboxSelect>>", self.on_list_selection)
         self.listbox.bind("<Button-3>", self.show_item_context_menu)
         self.listbox.bind("<Control-c>", self.copy_item_name)
         self.listbox.bind("<Control-v>", self.paste_item)
+
         self.item_context_menu = tk.Menu(self.root, tearoff=0)
         self.item_context_menu.add_command(label="파일 이름 복사", command=self.copy_item_name)
         self.item_context_menu.add_separator()
@@ -274,33 +624,46 @@ class ImageNameManager:
         self.item_context_menu.add_cascade(label="선택 항목 폴더로 이동", menu=self.move_context_menu)
         self.item_context_menu.add_separator()
         self.item_context_menu.add_command(label="선택 이미지 삭제", command=self.delete_selected_items)
-        edit=tk.Frame(main,bg="#252c37",highlightbackground="#394352",highlightthickness=1); edit.pack(fill="x",padx=17,pady=(0,15))
-        tk.Label(edit,text="이미지 등록 및 편집",bg="#252c37",fg="#e6eaf2",font=("Malgun Gothic",11,"bold")).grid(row=0,column=0,columnspan=4,sticky="w",padx=13,pady=(11,6))
-        tk.Label(edit,text="이름",bg="#252c37",fg="#aab5c5").grid(row=1,column=0,padx=(13,4),sticky="w")
-        self.name_var=tk.StringVar(); ttk.Entry(edit,textvariable=self.name_var).grid(row=1,column=1,sticky="ew",padx=5,pady=5)
-        tk.Label(edit,text="폴더",bg="#252c37",fg="#aab5c5").grid(row=1,column=2,padx=(10,4))
-        self.folder_var=tk.StringVar(value="기본"); self.folder_combo=ttk.Combobox(edit,textvariable=self.folder_var,state="readonly",width=13); self.folder_combo.grid(row=1,column=3,padx=(4,13),pady=5)
-        edit.columnconfigure(1,weight=1)
-        acts=tk.Frame(edit,bg="#252c37"); acts.grid(row=2,column=0,columnspan=4,sticky="ew",padx=13,pady=(6,12))
-        ttk.Button(acts,text="이미지 파일 선택",command=self.choose_image).pack(side="left")
-        ttk.Button(acts,text="스크린샷 붙여넣기",style="Soft.TButton",command=self.paste_screenshot).pack(side="left",padx=5)
-        ttk.Button(acts,text="선택 항목 불러오기",command=self.load_selected_item).pack(side="left",padx=5)
-        ttk.Button(acts,text="등록 / 수정",style="Accent.TButton",command=self.save_item).pack(side="left")
-        ttk.Button(acts,text="선택 삭제",command=self.delete_item).pack(side="left",padx=5)
-        ttk.Button(acts,text="초기화",command=self.clear_form).pack(side="right")
-        prev=tk.Frame(body,bg="#222833",highlightbackground="#343c49",highlightthickness=1,width=245); prev.pack(side="right",fill="y",padx=(12,0)); prev.pack_propagate(False)
-        tk.Label(prev,text="미리보기",bg="#222833",fg="#e6eaf2",font=("Malgun Gothic",12,"bold")).pack(anchor="w",padx=14,pady=(16,3))
-        tk.Label(prev,text="선택한 이미지가 표시됩니다",bg="#222833",fg="#929daf",font=("Malgun Gothic",8)).pack(anchor="w",padx=14)
-        self.preview=tk.Label(prev,text="이미지를 선택하거나\\n스크린샷을 붙여넣으세요.",bg="#191e27",fg="#8995a8",justify="center",font=("Malgun Gothic",9))
-        self.preview.pack(fill="both",expand=True,padx=12,pady=12)
+
+        edit = tk.Frame(main, bg="#252c37", highlightbackground="#394352", highlightthickness=1)
+        edit.pack(fill="x", padx=17, pady=(0, 15))
+        tk.Label(edit, text="이미지 등록 및 편집", bg="#252c37", fg="#e6eaf2", font=("Malgun Gothic", 11, "bold")).grid(row=0, column=0, columnspan=4, sticky="w", padx=13, pady=(11, 6))
+        tk.Label(edit, text="이름", bg="#252c37", fg="#aab5c5").grid(row=1, column=0, padx=(13, 4), sticky="w")
+        self.name_var = tk.StringVar()
+        ttk.Entry(edit, textvariable=self.name_var).grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+        tk.Label(edit, text="폴더", bg="#252c37", fg="#aab5c5").grid(row=1, column=2, padx=(10, 4))
+        self.folder_var = tk.StringVar(value="기본")
+        self.folder_combo = ttk.Combobox(edit, textvariable=self.folder_var, state="readonly", width=13)
+        self.folder_combo.grid(row=1, column=3, padx=(4, 13), pady=5)
+        edit.columnconfigure(1, weight=1)
+
+        acts = tk.Frame(edit, bg="#252c37")
+        acts.grid(row=2, column=0, columnspan=4, sticky="ew", padx=13, pady=(6, 12))
+        ttk.Button(acts, text="이미지 파일 선택", command=self.choose_image).pack(side="left")
+        ttk.Button(acts, text="스크린샷 즉시 저장", style="Accent.TButton", command=lambda: self.quick_save_clipboard(notify=False, source="직접 저장")).pack(side="left", padx=5)
+        ttk.Button(acts, text="선택 항목 불러오기", command=self.load_selected_item).pack(side="left", padx=5)
+        ttk.Button(acts, text="등록 / 수정", style="Soft.TButton", command=self.save_item).pack(side="left")
+        ttk.Button(acts, text="선택 삭제", command=self.delete_item).pack(side="left", padx=5)
+        ttk.Button(acts, text="초기화", command=self.clear_form).pack(side="right")
+
+        # 우측 미리보기 패널
+        prev = tk.Frame(body, bg="#222833", highlightbackground="#343c49", highlightthickness=1, width=255)
+        prev.pack(side="right", fill="y", padx=(12, 0))
+        prev.pack_propagate(False)
+        tk.Label(prev, text="미리보기", bg="#222833", fg="#e6eaf2", font=("Malgun Gothic", 12, "bold")).pack(anchor="w", padx=14, pady=(16, 3))
+        tk.Label(prev, text="선택한 이미지가 표시됩니다 (더블클릭 시 원본 크기)", bg="#222833", fg="#929daf", font=("Malgun Gothic", 8)).pack(anchor="w", padx=14)
+        self.preview = tk.Label(prev, text="이미지를 선택하거나\n스크린샷을 붙여넣으세요.", bg="#191e27", fg="#8995a8", justify="center", font=("Malgun Gothic", 9))
+        self.preview.pack(fill="both", expand=True, padx=12, pady=12)
         self.preview.bind("<Configure>", self.render_preview)
-        # 미리보기는 작게 유지하고, 더블클릭하면 원본 픽셀 크기로 별도 창에 표시합니다.
         self.preview.bind("<Double-Button-1>", self.open_original_preview)
-        foot=tk.Frame(outer,bg="#171a21"); foot.pack(fill="x",pady=(8,0))
-        self.status_var=tk.StringVar(value="준비")
-        tk.Label(foot,textvariable=self.status_var,bg="#171a21",fg="#929daf",font=("Malgun Gothic",9)).pack(side="left")
-        tk.Label(foot,text="Ctrl + V · 스크린샷 붙여넣기",bg="#171a21",fg="#8995a8",font=("Malgun Gothic",9)).pack(side="right")
-        self.root.bind_all("<Control-v>",self.on_paste_shortcut)
+
+        # 하단 상태 바
+        foot = tk.Frame(outer, bg="#171a21")
+        foot.pack(fill="x", pady=(8, 0))
+        self.status_var = tk.StringVar(value="준비됨 · 트레이 아이콘을 클릭하면 클립보드 스크린샷이 즉시 저장됩니다.")
+        tk.Label(foot, textvariable=self.status_var, bg="#171a21", fg="#929daf", font=("Malgun Gothic", 9)).pack(side="left")
+        tk.Label(foot, text="트레이 아이콘 클릭: 스크린샷 즉시 저장  ·  Ctrl+V: 붙여넣기", bg="#171a21", fg="#8995a8", font=("Malgun Gothic", 9)).pack(side="right")
+        self.root.bind_all("<Control-v>", self.on_paste_shortcut)
 
     def on_paste_shortcut(self, event):
         widget = self.root.focus_get()
@@ -310,7 +673,6 @@ class ImageNameManager:
         return "break"
 
     def refresh_folder_list(self, select_path=None):
-        """계층형 폴더 트리를 다시 만들고 지정한 폴더를 선택합니다."""
         if not hasattr(self, "folder_tree"):
             return
         current = select_path if select_path is not None else self.selected_folder()
@@ -324,7 +686,6 @@ class ImageNameManager:
                 built.append(part)
                 path = "/".join(built)
                 if path not in self.folder_tree.get_children(parent):
-                    # Treeview iid는 전체 경로로 고정해 하위 폴더도 안정적으로 선택합니다.
                     if not self.folder_tree.exists(path):
                         self.folder_tree.insert(parent, "end", iid=path, text=part, open=False)
                 parent = path
@@ -356,7 +717,7 @@ class ImageNameManager:
         self._folder_dragging = True
         top, bottom = sorted((self._folder_drag_start_y, event.y))
         picked = []
-        # 현재 화면에 표시된 트리 행 중 드래그 사각형과 겹치는 폴더를 선택
+
         def walk(parent=""):
             for iid in self.folder_tree.get_children(parent):
                 if iid != "__ALL__":
@@ -411,14 +772,12 @@ class ImageNameManager:
         return "break"
 
     def add_folder_from_context(self):
-        """우클릭한 폴더 아래에 새 하위 폴더를 추가합니다."""
         parent = getattr(self, "_folder_context_target", "")
         if parent and parent not in self.folders:
             parent = ""
         self._create_folder_at(parent, "하위 폴더 추가" if parent else "전체 이미지 하위 폴더 추가")
 
     def delete_selected_folders(self):
-        """우클릭 메뉴에서 선택된 폴더와 하위 폴더를 함께 삭제합니다."""
         selected = self.selected_folders()
         if not selected:
             messagebox.showinfo("폴더 선택", "삭제할 폴더를 선택하세요.")
@@ -496,8 +855,6 @@ class ImageNameManager:
         self.refresh_items()
 
     def on_list_selection(self, event=None):
-        # 목록을 클릭하면 미리보기만 바꾸고, 편집 대상(selected_id)은 건드리지 않습니다.
-        # 기존 항목을 수정하려면 '선택 항목 불러오기'를 눌러야 합니다.
         sel = self.listbox.curselection()
         if not sel:
             return
@@ -542,8 +899,6 @@ class ImageNameManager:
         folder = self.selected_folder()
         self.listbox.delete(0, tk.END)
         self.visible_items = []
-        # 검색어가 있으면 현재 폴더와 관계없이 모든 폴더에서 검색합니다.
-        # 폴더를 선택한 경우에는 해당 폴더와 그 하위 폴더의 항목을 표시합니다.
         for item in self.items:
             item_folder = item.get("folder", "기본")
             name = item.get("name", "이름 없음")
@@ -583,16 +938,13 @@ class ImageNameManager:
         self.refresh_items()
 
     def add_root_folder(self):
-        """선택한 폴더와 무관하게 전체 이미지 바로 아래에 최상위 폴더를 만듭니다."""
         self._create_folder_at("", "최상위 폴더 추가")
 
     def add_folder(self):
-        """선택된 폴더 안에 하위 폴더를 만듭니다. 전체 이미지 선택 시 최상위에 생성합니다."""
         parent = self.selected_folder()
         self._create_folder_at(parent, "하위 폴더 추가" if parent else "최상위 폴더 추가")
 
     def ask_wide_folder_name(self, initialvalue=""):
-        """넓은 입력창으로 폴더 이름을 변경합니다."""
         dialog = tk.Toplevel(self.root)
         dialog.title("폴더 이름 변경")
         dialog.configure(bg="#222833")
@@ -609,11 +961,14 @@ class ImageNameManager:
         entry = ttk.Entry(dialog, textvariable=value, width=48)
         entry.pack(fill="x", padx=22, pady=(0, 14))
         result = {"value": None}
+
         def accept(event=None):
             result["value"] = value.get()
             dialog.destroy()
+
         def cancel(event=None):
             dialog.destroy()
+
         buttons = tk.Frame(dialog, bg="#222833")
         buttons.pack(fill="x", padx=22)
         ttk.Button(buttons, text="취소", command=cancel).pack(side="right")
@@ -742,7 +1097,6 @@ class ImageNameManager:
             self.preview.configure(text=str(path), image="")
             return
         try:
-            # 원본을 보관하고 실제 미리보기 영역 크기에 맞춰 다시 그립니다.
             with Image.open(path) as source:
                 self.preview_source_image = source.copy()
             self.render_preview()
@@ -801,7 +1155,6 @@ class ImageNameManager:
             container.rowconfigure(0, weight=1)
             container.columnconfigure(0, weight=1)
 
-            # 축소/확대하지 않고 원본 픽셀 크기 그대로 PhotoImage로 표시합니다.
             viewer.original_photo = ImageTk.PhotoImage(original)
             canvas.create_image(0, 0, anchor="nw", image=viewer.original_photo)
             canvas.configure(scrollregion=(0, 0, width, height))
@@ -814,7 +1167,6 @@ class ImageNameManager:
         return "break"
 
     def show_item_context_menu(self, event):
-        # 이미 다중 선택된 항목 위에서 우클릭하면 선택을 유지합니다.
         index = self.listbox.nearest(event.y)
         row_box = self.listbox.bbox(index) if 0 <= index < len(self.visible_items) else None
         on_row = bool(row_box and row_box[1] <= event.y <= row_box[1] + row_box[3])
@@ -843,7 +1195,6 @@ class ImageNameManager:
         self.item_context_menu.tk_popup(event.x_root, event.y_root)
 
     def move_selected_items(self, target_folder):
-        """현재 다중 선택된 이미지 항목을 지정 폴더로 이동합니다."""
         indices = self.listbox.curselection()
         if not indices:
             return
@@ -860,7 +1211,6 @@ class ImageNameManager:
         self.status_var.set(f"선택한 이미지 {len(moving)}개를 '{target_folder}' 폴더로 이동했습니다.")
 
     def copy_item_for_duplicate(self):
-        """선택한 이미지 항목을 앱 내부 붙여넣기용으로 복사합니다."""
         sel = self.listbox.curselection()
         if not sel:
             return
@@ -868,7 +1218,6 @@ class ImageNameManager:
         self.status_var.set(f"'{self.copied_item.get('name', '이름 없음')}' 항목을 복사했습니다. 원하는 폴더에서 Ctrl+V를 누르세요.")
 
     def copy_item_name(self, event=None):
-        """선택한 이미지 항목의 이름을 Windows 클립보드로 복사한다."""
         sel = self.listbox.curselection()
         if not sel:
             return "break"
@@ -876,7 +1225,7 @@ class ImageNameManager:
         copied_text = "\n".join(names)
         self.root.clipboard_clear()
         self.root.clipboard_append(copied_text)
-        self.root.update()  # 앱이 닫혀도 클립보드 내용 유지
+        self.root.update()
         self.status_var.set(f"파일 이름 {len(names)}개를 클립보드에 복사했습니다.")
         return "break"
 
@@ -946,7 +1295,6 @@ class ImageNameManager:
             })
         self.save_data()
 
-        # 저장한 항목의 폴더를 왼쪽 목록에서도 선택해 바로 보이도록 합니다.
         try:
             self.refresh_folder_list(folder)
         except (ValueError, tk.TclError):
@@ -971,7 +1319,6 @@ class ImageNameManager:
             self.preview.configure(text="저장된 이미지 파일을 찾을 수 없습니다.", image="")
 
     def delete_selected_items(self):
-        """이미지 목록에서 선택된 여러 항목을 한 번에 삭제합니다. 원본 파일은 보존합니다."""
         indices = self.listbox.curselection()
         selected = [self.visible_items[i] for i in indices if 0 <= i < len(self.visible_items)]
         if not selected:
@@ -1020,10 +1367,12 @@ class ImageNameManager:
         self.search_var.set("")
         self.refresh_items()
 
+
 def main():
     root = tk.Tk()
-    ImageNameManager(root)
+    app = ImageNameManager(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()

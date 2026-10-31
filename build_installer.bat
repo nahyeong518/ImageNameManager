@@ -11,12 +11,12 @@ title ImageNameManager Setup Builder
 where py >nul 2>nul
 if errorlevel 1 goto NO_PYTHON
 
- echo [1/4] Installing build tools...
-py -3 -m pip install --upgrade pip Pillow PyInstaller
+ echo [1/4] Installing build tools and dependencies...
+py -3 -m pip install --upgrade pip Pillow PyInstaller pystray
 if errorlevel 1 goto BUILD_ERROR
 
  echo [2/4] Building ImageNameManager.exe...
-py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name ImageNameManager --collect-all PIL ImageNameManager.py
+py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name ImageNameManager --collect-all PIL --collect-all pystray ImageNameManager.py
 if errorlevel 1 goto BUILD_ERROR
 
  echo [3/4] Finding Inno Setup compiler...
