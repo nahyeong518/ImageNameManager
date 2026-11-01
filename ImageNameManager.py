@@ -5,7 +5,10 @@ import re
 import shutil
 import subprocess
 import sys
+import socket
 import threading
+import time
+import atexit
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from pathlib import Path, PureWindowsPath
@@ -121,9 +124,77 @@ def create_tray_icon_image():
     return img
 
 
+SINGLE_INSTANCE_PORT = 58921
+MUTEX_NAME = "ImageNameManager_SingleInstance_Mutex_Nahyeong"
+
+
+def check_single_instance():
+    """
+    단일 인스턴스 검사 및 중복 실행 방지.
+    이미 실행 중인 인스턴스가 있다면 소켓을 통해 창 활성화 신호(ACTIVATE)를 전달하고 (False, None)을 반환합니다.
+    첫 실행 인스턴스라면 소켓 리스너와 Win32 Mutex를 생성하고 (True, (server_socket, mutex))를 반환합니다.
+    """
+    # 1. 기존 실행 중인 프로세스의 소켓 연결 시도
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.6)
+    try:
+        s.connect(('127.0.0.1', SINGLE_INSTANCE_PORT))
+        s.sendall(b'ACTIVATE\n')
+        s.close()
+        return False, None
+    except (ConnectionRefusedError, OSError):
+        try:
+            s.close()
+        except Exception:
+            pass
+
+    # 2. Windows인 경우 Win32 Named Mutex로 2차 확인
+    mutex = None
+    if sys.platform == 'win32':
+        try:
+            mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
+            if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+                # 기존 인스턴스가 기동 중일 수 있으므로 소켓 재시도
+                time.sleep(0.2)
+                s_retry = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s_retry.settimeout(0.6)
+                try:
+                    s_retry.connect(('127.0.0.1', SINGLE_INSTANCE_PORT))
+                    s_retry.sendall(b'ACTIVATE\n')
+                    s_retry.close()
+                    if mutex:
+                        ctypes.windll.kernel32.CloseHandle(mutex)
+                    return False, None
+                except Exception:
+                    try:
+                        s_retry.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # 3. 최초 실행 인스턴스: 소켓 서버 바인딩
+    server_s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        server_s.bind(('127.0.0.1', SINGLE_INSTANCE_PORT))
+        server_s.listen(5)
+    except OSError:
+        if mutex and sys.platform == 'win32':
+            try:
+                ctypes.windll.kernel32.CloseHandle(mutex)
+            except Exception:
+                pass
+        return False, None
+
+    return True, (server_s, mutex)
+
+
 class ImageNameManager:
-    def __init__(self, root):
+    def __init__(self, root, single_instance_lock=None):
         self.root = root
+        self.single_instance_lock = single_instance_lock
+        self._is_closing = False
         self.root.title("이미지 & 메모장 관리")
         self.root.geometry("1080x720")
         self.root.minsize(880, 580)
@@ -173,6 +244,9 @@ class ImageNameManager:
         # 트레이 아이콘 및 클립보드 모니터링 시작
         self.setup_tray_icon()
         self.start_clipboard_monitor()
+
+        # 중복 실행 감지 및 외부 활성화 리스너 시작
+        self.start_single_instance_listener()
 
         # 1초 후 조용히 백그라운드 최신 버전 확인
         self.root.after(1000, lambda: self.check_for_updates(silent=True))
@@ -375,12 +449,66 @@ class ImageNameManager:
         else:
             self.confirm_save_and_close()
 
-    def quit_application(self):
-        try:
-            self.save_data()
-        except Exception as e:
-            messagebox.showerror("저장 오류", f"종료 중 데이터 저장에 실패했습니다.\n{e}", parent=self.root)
+    def start_single_instance_listener(self):
+        """중복 실행 시도 신호(ACTIVATE)를 수신하여 창을 복원하는 백그라운드 리스너를 시작합니다."""
+        if not self.single_instance_lock or not self.single_instance_lock[0]:
             return
+        server_s = self.single_instance_lock[0]
+
+        try:
+            self.root.bind("<<SingleInstanceActivate>>", lambda e: self.restore_and_focus())
+        except Exception:
+            pass
+
+        def listener_worker():
+            while not self._is_closing:
+                try:
+                    conn, _ = server_s.accept()
+                    data = conn.recv(1024)
+                    if b'ACTIVATE' in data:
+                        try:
+                            self.root.event_generate("<<SingleInstanceActivate>>", when="tail")
+                        except Exception:
+                            pass
+                        try:
+                            self.root.after(0, self.restore_and_focus)
+                        except Exception:
+                            pass
+                    conn.close()
+                except Exception:
+                    break
+
+        t = threading.Thread(target=listener_worker, daemon=True)
+        t.start()
+
+    def restore_and_focus(self):
+        """트레이에 숨겨져 있거나 최소화된 창을 화면 맨 앞으로 복원 및 포커스합니다."""
+        try:
+            if self.root.state() == "withdrawn":
+                self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(150, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+        except Exception as e:
+            print(f"창 복원 오류: {e}")
+
+    def cleanup_resources(self):
+        """소켓 서버, Mutex 및 트레이 아이콘 자원을 안전하게 해제합니다."""
+        self._is_closing = True
+        if self.single_instance_lock:
+            server_s, mutex = self.single_instance_lock
+            try:
+                server_s.close()
+            except Exception:
+                pass
+            if mutex and sys.platform == "win32":
+                try:
+                    ctypes.windll.kernel32.CloseHandle(mutex)
+                except Exception:
+                    pass
+            self.single_instance_lock = None
 
         if self.tray_icon:
             try:
@@ -389,6 +517,14 @@ class ImageNameManager:
                 pass
             self.tray_icon = None
 
+    def quit_application(self):
+        try:
+            self.save_data()
+        except Exception as e:
+            messagebox.showerror("저장 오류", f"종료 중 데이터 저장에 실패했습니다.\n{e}", parent=self.root)
+            return
+
+        self.cleanup_resources()
         self.root.destroy()
         sys.exit(0)
 
@@ -777,11 +913,7 @@ class ImageNameManager:
             )
             return
 
-        if self.tray_icon:
-            try:
-                self.tray_icon.stop()
-            except Exception:
-                pass
+        self.cleanup_resources()
 
         messagebox.showinfo(
             "저장 완료",
@@ -2105,8 +2237,31 @@ class ImageNameManager:
 
 
 def main():
+    is_primary, lock_tuple = check_single_instance()
+    if not is_primary:
+        try:
+            dummy = tk.Tk()
+            dummy.withdraw()
+            for p in [APP_DIR / "app.ico", APP_DIR / "app_icon.png"]:
+                if p.is_file():
+                    try:
+                        dummy.iconbitmap(str(p.resolve()))
+                        break
+                    except Exception:
+                        pass
+            messagebox.showinfo(
+                "프로그램 실행 알림",
+                "ImageNameManager가 이미 실행 중입니다.\n\n기존에 실행 중인 창을 화면 맨 앞으로 불러옵니다.",
+                parent=dummy
+            )
+            dummy.destroy()
+        except Exception:
+            pass
+        sys.exit(0)
+
     root = tk.Tk()
-    app = ImageNameManager(root)
+    app = ImageNameManager(root, single_instance_lock=lock_tuple)
+    atexit.register(app.cleanup_resources)
     root.mainloop()
 
 

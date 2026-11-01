@@ -21,12 +21,14 @@ WizardStyle=modern
 SetupIconFile=app.ico
 UninstallDisplayIcon={app}\app.ico
 ArchitecturesInstallIn64BitMode=x64
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "바탕 화면 바로 가기 만들기"; GroupDescription: "추가 작업:"; Flags: unchecked
+Name: "desktopicon"; Description: "바탕 화면 바로가기 만들기"; GroupDescription: "추가 작업:"; Flags: unchecked
 
 [Files]
 Source: "dist\ImageNameManager.exe"; DestDir: "{app}"; Flags: ignoreversion
