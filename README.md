@@ -24,5 +24,6 @@
 - 빨간 동그라미 클릭
 <img width="73" height="147" alt="image_20261101_121042_422004" src="https://github.com/user-attachments/assets/7dc9cc08-2d54-4857-8867-dc45f151e2e5" />
 
-- ImageNameData 폴더를 복사한뒤 새로다운받아 바탕화면에 생성됀 ImageNameManager 폴더(윗그림)에 붙여넣기 하면 끝
+- ImageNameData 폴더를 복사한뒤 
+새로다운받아 바탕화면에 생성된 ImageNameManager 폴더(윗그림)에 붙여넣기 하면 끝
 <img width="615" height="96" alt="image_20261101_121157_654917" src="https://github.com/user-attachments/assets/03a3b4f7-4204-4e1d-b315-374823341598" />
