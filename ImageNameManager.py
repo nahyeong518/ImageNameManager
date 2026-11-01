@@ -1,13 +1,22 @@
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from pathlib import Path, PureWindowsPath
 from datetime import datetime
+import urllib.request
+import webbrowser
+
+APP_VERSION = "v1.2.0"
+GITHUB_REPO = "nahyeong518/ImageNameManager"
+LATEST_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest" 
 
 try:
     from PIL import Image, ImageGrab, ImageTk, ImageDraw, ImageFont
@@ -139,6 +148,9 @@ class ImageNameManager:
         # 트레이 아이콘 및 클립보드 모니터링 시작
         self.setup_tray_icon()
         self.start_clipboard_monitor()
+
+        # 1초 후 조용히 백그라운드 최신 버전 확인
+        self.root.after(1000, lambda: self.check_for_updates(silent=True))
 
     def load_data(self):
         if not DATA_FILE.exists():
@@ -653,6 +665,76 @@ class ImageNameManager:
 
     # ------------------ 기존 UI 및 관리 로직 ------------------
 
+    def check_for_updates(self, silent=True):
+        """GitHub 최신 릴리즈를 확인하여 새 버전이 있으면 알림을 제공합니다."""
+        def safe_after(fn):
+            try:
+                if self.root and self.root.winfo_exists():
+                    self.root.after(0, fn)
+            except Exception:
+                pass
+
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    GITHUB_API_LATEST,
+                    headers={"User-Agent": "ImageNameManager-App"}
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status != 200:
+                        return
+                    data = json.loads(resp.read().decode("utf-8"))
+
+                latest_tag = data.get("tag_name", "").strip()
+                if not latest_tag:
+                    return
+
+                def parse_ver(v_str):
+                    nums = re.findall(r"\d+", str(v_str))
+                    return [int(n) for n in nums] if nums else [0]
+
+                cur_nums = parse_ver(APP_VERSION)
+                new_nums = parse_ver(latest_tag)
+
+                if new_nums > cur_nums:
+                    def notify_update():
+                        if hasattr(self, "update_btn"):
+                            self.update_btn.configure(
+                                text=f"🔔 새 버전 ({latest_tag}) 발견!",
+                                style="Accent.TButton"
+                            )
+                        self.status_var.set(f"🔔 새로운 버전({latest_tag})이 출시되었습니다. 상단 버튼을 눌러 다운로드하세요!")
+                        if messagebox.askyesno(
+                            "새로운 버전 업데이트 알림",
+                            f"새로운 버전({latest_tag})이 출시되었습니다!\n\n"
+                            f"현재 버전: {APP_VERSION}\n"
+                            f"최신 버전: {latest_tag}\n\n"
+                            "지금 다운로드 페이지(웹 브라우저)를 열어 최신 설치 파일을 받으시겠습니까?",
+                            parent=self.root
+                        ):
+                            webbrowser.open(LATEST_RELEASE_URL)
+                    safe_after(notify_update)
+                else:
+                    if not silent:
+                        def notify_latest():
+                            messagebox.showinfo(
+                                "업데이트 확인",
+                                f"현재 최신 버전({APP_VERSION})을 사용하고 있습니다! 👍\n\n새로운 업데이트가 없습니다.",
+                                parent=self.root
+                            )
+                        safe_after(notify_latest)
+            except Exception as e:
+                if not silent:
+                    def notify_error():
+                        messagebox.showwarning(
+                            "업데이트 확인 오류",
+                            f"최신 버전 정보를 확인하지 못했습니다.\n인터넷 연결 상태를 확인해 주세요.\n\n({e})",
+                            parent=self.root
+                        )
+                    safe_after(notify_error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def confirm_save_and_close(self):
         try:
             self.save_data()
@@ -736,8 +818,13 @@ class ImageNameManager:
         self.auto_save_btn.pack(side="left", padx=3)
         ttk.Button(right_controls, text="🔽 트레이로 숨기기", command=self.toggle_window).pack(side="left", padx=3)
 
-        self.header_count = tk.Label(right_controls, text="0 ITEMS", bg="#263449", fg="#e6edf7", font=("Malgun Gothic", 9, "bold"), padx=12, pady=6)
-        self.header_count.pack(side="left", padx=(6, 0))
+        self.update_btn = ttk.Button(
+            right_controls,
+            text=f"🔄 업데이트 확인 ({APP_VERSION})",
+            style="Soft.TButton",
+            command=lambda: self.check_for_updates(silent=False)
+        )
+        self.update_btn.pack(side="left", padx=3)
 
         body = tk.Frame(outer, bg="#171a21")
         body.pack(fill="both", expand=True)
