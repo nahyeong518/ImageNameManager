@@ -15,8 +15,8 @@ if errorlevel 1 goto NO_PYTHON
 py -3 -m pip install --upgrade pip Pillow PyInstaller pystray
 if errorlevel 1 goto BUILD_ERROR
 
- echo [2/4] Building ImageNameManager.exe...
-py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name ImageNameManager --collect-all PIL --collect-all pystray ImageNameManager.py
+ echo [2/4] Building ImageNameManager.exe with custom icon...
+py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name ImageNameManager --icon=app.ico --add-data "app.ico;." --add-data "app_icon.png;." --collect-all PIL --collect-all pystray ImageNameManager.py
 if errorlevel 1 goto BUILD_ERROR
 
  echo [3/4] Finding Inno Setup compiler...

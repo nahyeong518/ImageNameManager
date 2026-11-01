@@ -100,7 +100,14 @@ def render_note_to_image(text, title="메모장"):
 
 
 def create_tray_icon_image():
-    """트레이에 표시할 고해상도 카메라/이미지 아이콘을 생성합니다."""
+    """트레이에 표시할 고해상도 앱 아이콘을 반환합니다."""
+    for p in [APP_DIR / "app_icon.png", Path(__file__).resolve().parent / "app_icon.png" if "__file__" in globals() else None, APP_DIR / "app.ico"]:
+        if p and p.is_file() and Image is not None:
+            try:
+                img = Image.open(p).convert("RGBA")
+                return img.resize((64, 64), Image.LANCZOS)
+            except Exception:
+                pass
     size = (64, 64)
     if Image is None or ImageDraw is None:
         return None
@@ -120,6 +127,24 @@ class ImageNameManager:
         self.root.title("이미지 & 메모장 관리")
         self.root.geometry("1080x720")
         self.root.minsize(880, 580)
+
+        # 창 및 작업표시줄 아이콘 설정
+        for p in [APP_DIR / "app.ico", Path(__file__).resolve().parent / "app.ico" if "__file__" in globals() else None]:
+            if p and p.is_file():
+                try:
+                    self.root.iconbitmap(str(p.resolve()))
+                    break
+                except Exception:
+                    pass
+        for p in [APP_DIR / "app_icon.png", Path(__file__).resolve().parent / "app_icon.png" if "__file__" in globals() else None]:
+            if p and p.is_file() and Image is not None and ImageTk is not None:
+                try:
+                    self._window_icon_photo = ImageTk.PhotoImage(file=str(p.resolve()))
+                    self.root.iconphoto(True, self._window_icon_photo)
+                    break
+                except Exception:
+                    pass
+
         self.items = []
         self.folders = ["기본"]
         self.selected_id = None

@@ -1,5 +1,5 @@
-﻿#define MyAppName "ImageNameManager"
-#define MyAppVersion "1.0.0"
+#define MyAppName "ImageNameManager"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "ImageNameManager"
 #define MyAppExeName "ImageNameManager.exe"
 
@@ -18,7 +18,8 @@ OutputBaseFilename=ImageNameManager_Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
-UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=app.ico
+UninstallDisplayIcon={app}\app.ico
 ArchitecturesInstallIn64BitMode=x64
 
 [Languages]
@@ -29,10 +30,12 @@ Name: "desktopicon"; Description: "바탕 화면 바로 가기 만들기"; Group
 
 [Files]
 Source: "dist\ImageNameManager.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "app_icon.png"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\ImageNameManager"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\ImageNameManager"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\ImageNameManager"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"
+Name: "{autodesktop}\ImageNameManager"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\app.ico"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "ImageNameManager 실행"; Flags: postinstall nowait skipifsilent
