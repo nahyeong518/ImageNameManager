@@ -45,6 +45,37 @@ IMAGES_DIR = DATA_DIR / "images"
 NOTES_DIR = DATA_DIR / "notes"
 DATA_FILE = DATA_DIR / "data.json"
 
+
+def get_resource_path(relative_name):
+    """실행 환경(PyInstaller _MEIPASS 임시폴더, exe 폴더, 소스 폴더 등)에서 리소스 파일을 안전하게 검색합니다."""
+    candidates = []
+    # 1. PyInstaller _MEIPASS 임시 디렉토리 (가장 최우선)
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        try:
+            candidates.append(Path(sys._MEIPASS) / relative_name)
+        except Exception:
+            pass
+    # 2. 실행 파일(.exe)이 위치한 디렉토리
+    if getattr(sys, "frozen", False):
+        try:
+            candidates.append(Path(sys.executable).resolve().parent / relative_name)
+        except Exception:
+            pass
+    # 3. 소스코드(.py)가 위치한 디렉토리
+    if "__file__" in globals() and __file__:
+        try:
+            candidates.append(Path(__file__).resolve().parent / relative_name)
+        except Exception:
+            pass
+    # 4. APP_DIR 및 작업 디렉토리
+    candidates.append(APP_DIR / relative_name)
+    candidates.append(Path.cwd() / relative_name)
+
+    for p in candidates:
+        if p and p.is_file():
+            return p
+    return None
+
 # 바탕화면 설치 시 기존 데이터 폴더 마이그레이션
 if getattr(sys, "frozen", False) and not DATA_DIR.exists():
     old_data_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Programs" / "ImageNameManager" / "ImageNameData"
@@ -104,13 +135,13 @@ def render_note_to_image(text, title="메모장"):
 
 def create_tray_icon_image():
     """트레이에 표시할 고해상도 앱 아이콘을 반환합니다."""
-    for p in [APP_DIR / "app_icon.png", Path(__file__).resolve().parent / "app_icon.png" if "__file__" in globals() else None, APP_DIR / "app.ico"]:
-        if p and p.is_file() and Image is not None:
-            try:
-                img = Image.open(p).convert("RGBA")
-                return img.resize((64, 64), Image.LANCZOS)
-            except Exception:
-                pass
+    icon_path = get_resource_path("app_icon.png") or get_resource_path("app.ico")
+    if icon_path and icon_path.is_file() and Image is not None:
+        try:
+            img = Image.open(icon_path).convert("RGBA")
+            return img.resize((64, 64), Image.LANCZOS)
+        except Exception:
+            pass
     size = (64, 64)
     if Image is None or ImageDraw is None:
         return None
@@ -199,22 +230,21 @@ class ImageNameManager:
         self.root.geometry("1080x720")
         self.root.minsize(880, 580)
 
-        # 창 및 작업표시줄 아이콘 설정
-        for p in [APP_DIR / "app.ico", Path(__file__).resolve().parent / "app.ico" if "__file__" in globals() else None]:
-            if p and p.is_file():
-                try:
-                    self.root.iconbitmap(str(p.resolve()))
-                    break
-                except Exception:
-                    pass
-        for p in [APP_DIR / "app_icon.png", Path(__file__).resolve().parent / "app_icon.png" if "__file__" in globals() else None]:
-            if p and p.is_file() and Image is not None and ImageTk is not None:
-                try:
-                    self._window_icon_photo = ImageTk.PhotoImage(file=str(p.resolve()))
-                    self.root.iconphoto(True, self._window_icon_photo)
-                    break
-                except Exception:
-                    pass
+        # 창 및 작업표시줄 아이콘 설정 (PyInstaller _MEIPASS 및 설치 경로 우선 탐색)
+        ico_path = get_resource_path("app.ico")
+        if ico_path:
+            try:
+                self.root.iconbitmap(str(ico_path.resolve()))
+            except Exception:
+                pass
+
+        png_path = get_resource_path("app_icon.png") or ico_path
+        if png_path and Image is not None and ImageTk is not None:
+            try:
+                self._window_icon_photo = ImageTk.PhotoImage(file=str(png_path.resolve()))
+                self.root.iconphoto(True, self._window_icon_photo)
+            except Exception:
+                pass
 
         self.items = []
         self.folders = ["기본"]
@@ -2242,13 +2272,12 @@ def main():
         try:
             dummy = tk.Tk()
             dummy.withdraw()
-            for p in [APP_DIR / "app.ico", APP_DIR / "app_icon.png"]:
-                if p.is_file():
-                    try:
-                        dummy.iconbitmap(str(p.resolve()))
-                        break
-                    except Exception:
-                        pass
+            ico_p = get_resource_path("app.ico")
+            if ico_p:
+                try:
+                    dummy.iconbitmap(str(ico_p.resolve()))
+                except Exception:
+                    pass
             messagebox.showinfo(
                 "프로그램 실행 알림",
                 "ImageNameManager가 이미 실행 중입니다.\n\n기존에 실행 중인 창을 화면 맨 앞으로 불러옵니다.",

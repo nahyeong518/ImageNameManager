@@ -19,6 +19,9 @@ if errorlevel 1 goto BUILD_ERROR
 py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name ImageNameManager --icon=app.ico --add-data "app.ico;." --add-data "app_icon.png;." --collect-all PIL --collect-all pystray ImageNameManager.py
 if errorlevel 1 goto BUILD_ERROR
 
+copy /y app.ico dist\ >nul
+copy /y app_icon.png dist\ >nul
+
  echo [3/4] Finding Inno Setup compiler...
 set "ISCC="
 if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
@@ -29,8 +32,19 @@ if not defined ISCC goto NO_INNO
 "%ISCC%" ImageNameManager_Setup.iss
 if errorlevel 1 goto BUILD_ERROR
 
+if exist "Output\ImageNameManager_Setup.exe" (
+    copy /y "Output\ImageNameManager_Setup.exe" "Output\ImageNameManager_v1.2.0_Setup.exe" >nul
+    copy /y "Output\ImageNameManager_Setup.exe" "%USERPROFILE%\Downloads\ImageNameManager_Setup.exe" >nul
+)
+
+REM Refresh Windows Shell Icon Cache
+ie4uinit.exe -show >nul 2>nul
+
  echo.
+ echo ==================================================
  echo SUCCESS: Output\ImageNameManager_Setup.exe
+ echo SUCCESS: Output\ImageNameManager_v1.2.0_Setup.exe
+ echo ==================================================
 if exist "Output\ImageNameManager_Setup.exe" start "" "%CD%\Output"
 pause
 exit /b 0
