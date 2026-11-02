@@ -29,12 +29,12 @@ if not defined ISCC if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%P
 if not defined ISCC goto NO_INNO
 
  echo [4/4] Creating Setup.exe...
+if exist "Output\ImageNameManager_Setup.exe" del /f /q "Output\ImageNameManager_Setup.exe" >nul 2>nul
 "%ISCC%" ImageNameManager_Setup.iss
 if errorlevel 1 goto BUILD_ERROR
 
-if exist "Output\ImageNameManager_Setup.exe" (
-    copy /y "Output\ImageNameManager_Setup.exe" "Output\ImageNameManager_v1.2.0_Setup.exe" >nul
-    copy /y "Output\ImageNameManager_Setup.exe" "%USERPROFILE%\Downloads\ImageNameManager_Setup.exe" >nul
+if exist "Output\ImageNameManager_v1.2.0_Setup.exe" (
+    copy /y "Output\ImageNameManager_v1.2.0_Setup.exe" "%USERPROFILE%\Downloads\ImageNameManager_v1.2.0_Setup.exe" >nul
 )
 
 REM Refresh Windows Shell Icon Cache
@@ -42,10 +42,9 @@ ie4uinit.exe -show >nul 2>nul
 
  echo.
  echo ==================================================
- echo SUCCESS: Output\ImageNameManager_Setup.exe
  echo SUCCESS: Output\ImageNameManager_v1.2.0_Setup.exe
  echo ==================================================
-if exist "Output\ImageNameManager_Setup.exe" start "" "%CD%\Output"
+if exist "Output\ImageNameManager_v1.2.0_Setup.exe" start "" "%CD%\Output"
 pause
 exit /b 0
 
