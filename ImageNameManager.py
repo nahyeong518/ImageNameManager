@@ -16,7 +16,7 @@ from datetime import datetime
 import urllib.request
 import webbrowser
 
-APP_VERSION = "v1.2.0"
+APP_VERSION = "v1.2.1"
 GITHUB_REPO = "nahyeong518/ImageNameManager"
 LATEST_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest" 

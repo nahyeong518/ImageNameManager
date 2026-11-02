@@ -1,5 +1,5 @@
 #define MyAppName "ImageNameManager"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyAppPublisher "ImageNameManager"
 #define MyAppExeName "ImageNameManager.exe"
 
@@ -14,7 +14,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=Output
-OutputBaseFilename=ImageNameManager_v1.2.0_Setup
+OutputBaseFilename=ImageNameManager_v1.2.1_Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
